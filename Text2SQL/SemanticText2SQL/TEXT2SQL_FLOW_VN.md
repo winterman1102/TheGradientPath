@@ -77,6 +77,8 @@ JSON Response
     }
   ]
 }
+
+Lưu ý: LLM có thể sinh trực tiếp các biểu thức Levenshtein (ví dụ `levenshtein(...)`) trong `sql_query`. Trong repo này, file `init-db.sql` đã tạo sẵn extension `fuzzystrmatch`, vì vậy các hàm `levenshtein` có thể được dùng trực tiếp trong SQL mà không cần một bước xử lý riêng biệt.
 ```
 
 **Thành Phần Chính**:
@@ -174,6 +176,8 @@ Kết Quả: PASS → Thực Thi | FAIL → Thử Lại/Hủy
 - **Vi Phạm Bảo Mật**: Hủy ngay lập tức (không thử lại)
 - **Lỗi Có Thể Sửa**: Kích hoạt cơ chế thử lại
 - Sử dụng `sqlglot` để parse và xác thực
+ 
+Lưu ý hiệu năng: Khi `sql_query` chứa `levenshtein(...)`, phép tính này sẽ thực hiện trên tập ứng viên do SQL trả về. Vì vậy thường nên kết hợp lọc nhanh (ví dụ `ILIKE`, `pg_trgm` hoặc các điều kiện WHERE khác) trước khi áp dụng `levenshtein` để giảm số hàng phải so sánh.
 
 ---
 
@@ -273,6 +277,89 @@ Cả ba đều là kiệt tác văn học dystopian!"
 ```
 
 ---
+
+## 🧩 Mẫu Prompt/Request Tới LLM Ở MỖI BƯỚC (Ví dụ)
+
+Phần này cung cấp các ví dụ prompt/requests mà `AgentTextToSql` có thể gửi đến LLM ở từng bước của pipeline. Các ví dụ này giúp bạn hiểu chính xác nội dung ngữ cảnh (system + user) và dữ liệu được truyền cho mô hình.
+
+1) Sinh SQL (generate_sql)
+
+System prompt (cung cấp schema và quy tắc bảo mật):
+```
+You are a SQL generation assistant. The database schema is provided below. Only generate a SELECT query. Do NOT include INSERT/UPDATE/DELETE statements. Use the following JSON format as the only output: {"sql_query": "...", "need_embedding": true|false, "embedding_params": [{"placeholder":"embedding_1","text_to_embed":"...","table_field":"books.description_embed"}] }
+
+Schema:
+<PASTE_SCHEMA_HERE>
+
+Rules:
+- Only SELECT allowed
+- Use pgvector for semantic search when needed
+- Use levenshtein(...) if fuzzy match required
+- Keep temperature low (0.1)
+```
+
+User prompt (ví dụ):
+```
+Người dùng: "Tìm sách dystopian tương tự 1984 của tác giả có tên gần giống 'Azimov' xuất bản sau 1980"
+Task: Generate a SQL query (and whether embeddings are needed). If semantic search is required, include embedding_params with placeholder.
+```
+
+Expected LLM response (JSON):
+```
+{
+    "sql_query": "SELECT b.*, a.first_name, a.last_name FROM books b JOIN authors a ON b.author_id = a.author_id WHERE (b.description_embed <-> %s::vector) < 0.5 AND levenshtein(LOWER(a.last_name), LOWER('Azimov')) <= 2 AND b.publication_date > '1980-01-01' ORDER BY (b.description_embed <-> %s::vector) LIMIT 20;",
+    "need_embedding": true,
+    "embedding_params": [
+        {"placeholder": "%s", "text_to_embed": "tương tự 1984 giám sát toàn trị", "table_field": "books.description_embed"}
+    ]
+}
+```
+
+2) Sinh Embedding (khi need_embedding = true)
+
+Request tới Embedding API (agent nội bộ — không gửi thẳng LLM):
+```
+Model: text-embedding-3-small
+Input: "tương tự 1984 giám sát toàn trị"
+Return: [0.123, -0.456, ...]
+```
+
+3) Xác Thực SQL (validation)
+
+System prompt (nội bộ, gửi đến LLM để xin gợi ý sửa lỗi khi retry):
+```
+The following SQL failed execution with error: {error_message}
+Constraints:
+- Only SELECT allowed
+- No nested writes, no dangerous functions
+Please suggest a corrected SQL that follows the constraints and keeps the original intent.
+Original SQL:
+{failed_sql}
+```
+
+4) Thực Thi Truy Vấn (database execution — agent xử lý, không cần LLM)
+
+Agent will substitute embedding placeholders and execute with psycopg2. No LLM call required unless execution fails and retry step triggers.
+
+5) Sinh Câu Trả Lời (generate_answer)
+
+System prompt (formatting):
+```
+You are a helpful assistant. Given the original user question and the SQL result set (top 20 rows, column names), produce a concise natural language answer in the user's language. Emphasize main findings and, if applicable, mention fuzzy matches (e.g. "matched 'Azimov' → 'Asimov' with distance 1").
+
+User context:
+- Original question: {user_question}
+- ResultRows: {rows}
+- ColumnNames: {column_names}
+
+Formatting rules:
+- Keep answer under 300 words
+- Use bullet list for multiple items
+- If zero rows, offer a helpful suggestion for refining query
+```
+
+Ghi chú: Các prompt trên là mẫu; agent thực tế sẽ chèn schema đầy đủ, lịch sử thất bại (nếu có), và các thông tin metadata (ngôn ngữ người dùng, ngưỡng Levenshtein đề xuất) trước khi gửi yêu cầu tới LLM.
+
 
 ## 🔄 Cơ Chế Thử Lại (Khôi Phục Lỗi Thông Minh)
 
@@ -567,6 +654,8 @@ categories (danh mục)
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Fuzzy string matching (Khoảng cách Levenshtein)
+-- Extension `fuzzystrmatch` đã được tạo trong `init-db.sql` của repo;
+-- nếu bạn khởi tạo DB bằng `init-db.sql` (docker-compose) thì đã có sẵn.
 CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
 ```
 
